@@ -847,11 +847,202 @@ Several approaches:
 3. **Residual learning**: Instead of predicting H directly, have the meta-learner predict the **correction** to the best single model. This focuses its capacity on fixing errors
 4. **Bias correction**: Add the true H values' statistics (mean, percentile) as additional features, or use a calibration function post-hoc to remove systematic bias
 
+### 7.5 Part 3 & 4 Results
+
+```
+Method          MAE      RMSE     Bias     Params
+──────────────────────────────────────────────────
+R/S            0.1407   0.1673   +0.096    n/a
+DFA            0.0979   0.1179   +0.068    n/a
+CNN            0.0863   0.1106   -0.029    232,513
+Dense          0.0733   0.0933   -0.008    70,017
+Ensemble+      0.0665   0.0828   -0.006    737
+Ensemble       0.0643   0.0814   -0.004    193
+```
+
+![Full comparison summary](plots/ensemble/full_comparison_summary.png)
+
+![Full bias and MAD comparison](plots/ensemble/full_comparison.png)
+
+**Key findings and what they mean:**
+
+**1. Dense beats CNN on short series (surprising!)**
+
+The CNN (MAE 0.0863) is actually worse than the Dense network (MAE 0.0733). This is counterintuitive — we said CNNs should be better because they detect local patterns. What happened?
+
+The issue is **series length**. With T=100, after three rounds of convolution + pooling, the CNN has compressed the time series down to just ~12 values before the dense layers. That's aggressive — we might be losing information. The Dense network, seeing all 100 values at once without compression, can preserve more detail.
+
+On longer series (T=500 or T=1000), the CNN would likely win because local feature detection becomes more valuable when there's more data to scan. For T=100, the Dense network's ability to see everything simultaneously is an advantage.
+
+**2. The CNN has more negative bias than Dense**
+
+The CNN underestimates H more (bias = -0.029 vs -0.008). Looking at the bias plot, the CNN particularly struggles at **high H values** (H > 0.7), pulling predictions toward the center. This is because its compressed representation loses the subtle differences between H=0.8 and H=0.9 — those differences are in long-range correlations that get pooled away.
+
+**3. Ensemble is the clear winner**
+
+The basic Ensemble (MAE 0.0643) beats both individual models with only **193 parameters** — far fewer than either base model. This proves the key point of stacking: Dense and CNN make different errors, and even a tiny meta-learner can learn to exploit the complementarity.
+
+The bias dropped to -0.004 (nearly zero). The meta-learner learned when to trust Dense vs CNN.
+
+**4. Enhanced ensemble didn't help (and why that's informative)**
+
+The Ensemble+ with uncertainty features (MAE 0.0665) is slightly worse than the basic Ensemble (0.0643). This means the MC Dropout uncertainty estimates don't add useful information beyond what the raw predictions already contain. The meta-learner can already figure out "when predictions disagree, be cautious" just from the two prediction values themselves.
+
+This is a valid negative result — it tells us that for this problem size, the simpler approach is better. Adding features can actually hurt if they introduce noise without adding signal.
+
+**5. The progression tells a story**
+
+```
+R/S (1951)   → 0.1407   Classical, no learning
+DFA (1994)   → 0.0979   Better classical method
+CNN (2020)   → 0.0863   Deep learning, local patterns
+Dense        → 0.0733   Deep learning, global view
+Ensemble     → 0.0643   Combining both perspectives
+```
+
+Each step represents a real improvement. The full pipeline cuts the error by more than half compared to R/S. The ensemble's near-zero bias means it's not systematically wrong in any direction — crucial for trading applications where systematic errors compound over time.
+
 ---
 
 ## 8. Part 5: Real Data & Trading
 
-*To be completed after Part 5 implementation.*
+### 8.1 From Synthetic to Real Data
+
+Everything so far used synthetic fBM data where we **know** the true H. Now we apply our trained models to **real** financial data where H is unknown. This is the moment of truth — does what we learned from synthetic data transfer to real markets?
+
+The assumption: real financial returns, over short windows, behave "close enough" to fBM increments that a model trained on fBM can give useful H estimates. This is supported by the rough volatility literature (Gatheral et al., 2018) which shows that fBM is a reasonable model for financial time series.
+
+### 8.2 Log Returns
+
+When working with financial data, we use **log returns** instead of simple returns:
+
+```
+log_return_t = ln(price_t / price_{t-1}) = ln(price_t) - ln(price_{t-1})
+```
+
+**Why log returns instead of simple returns `(price_t - price_{t-1}) / price_{t-1}`?**
+
+1. **Additivity**: Log returns over multiple periods add up. `ln(P2/P0) = ln(P2/P1) + ln(P1/P0)`. Simple returns don't: `(1+r1)(1+r2) - 1 ≠ r1 + r2`.
+2. **Symmetry**: A +10% log return and -10% log return cancel exactly. Simple returns don't: +10% then -10% gives you 99% of original, not 100%.
+3. **Stationarity**: Log returns are more stationary than simple returns (closer to constant statistical properties over time).
+4. **Small values**: For small changes, log returns ≈ simple returns. The difference only matters for large moves.
+
+### 8.3 The Rolling Window Approach
+
+We can't just feed the entire 5-year history into our model — it expects 100-point inputs. Instead, we use a **rolling window**:
+
+```
+Day 1-100:    [r_1, r_2, ..., r_100]      → estimate H_100
+Day 2-101:    [r_2, r_3, ..., r_101]      → estimate H_101
+Day 3-102:    [r_3, r_4, ..., r_102]      → estimate H_102
+...
+```
+
+Each window of T=100 consecutive log returns gets fed into the model, producing an H estimate for that moment in time. As the window slides forward, we get a **time series of H estimates**.
+
+In matrix form (as the TP describes):
+
+```
+        r_1    r_2    ...  r_T
+X =     r_2    r_3    ...  r_{T+1}
+        ...
+        r_k    r_{k+1} ... r_{T+k}
+```
+
+Each row is one window. Each row gets rescaled (zero mean, unit variance) independently — the same per-sample rescaling we used in training.
+
+### 8.4 The Trading Strategy
+
+The idea is simple:
+- **H > 0.5 (significantly)**: The series is trending → **buy** (go long) — follow the trend
+- **H < 0.5 (significantly)**: The series is mean-reverting → **sell** (go short) — bet on reversal
+- **H ≈ 0.5**: Random walk, no edge → **stay flat** (no position)
+
+"Significantly different" means we set a **threshold** δ (e.g., δ = 0.05):
+- If H > 0.5 + δ → long position (+1)
+- If H < 0.5 - δ → short position (-1)
+- Otherwise → flat (0)
+
+The **daily profit** of this strategy:
+
+```
+profit_t = position_{t-1} × real_return_t
+```
+
+Where `real_return_t = price_t / price_{t-1} - 1` (the actual simple return, not log return — because real P&L is in simple returns).
+
+**Why real returns for profit but log returns for estimation?** Log returns are better for statistical modeling (what the network sees). But when you actually make/lose money, it's based on the real price change percentage. A stock going from $100 to $110 makes you $10, which is a 10% simple return. The log return `ln(110/100) = 0.0953` is close but not exactly 10%.
+
+### 8.5 Cumulative Returns and Comparison
+
+The **cumulative return** of the strategy over time:
+
+```
+cumulative_t = product(1 + profit_i for i in 1..t)
+```
+
+Starting at 1, this shows how $1 invested at the start would grow (or shrink) over time. We plot this alongside the asset's own cumulative return (buy and hold) to compare.
+
+**What we hope to see**:
+- The strategy grows faster than buy-and-hold during trending periods (correctly riding momentum)
+- The strategy avoids losses during mean-reverting periods (correctly staying flat or shorting)
+- The strategy doesn't trade during random-walk periods (correctly staying flat)
+
+**What we'll likely see** (honest expectations):
+- Some periods where the strategy works well
+- Some periods where it doesn't — because H estimates are noisy and markets are complex
+- **Transaction costs** will eat into returns if the strategy trades too frequently
+
+### 8.6 Transaction Costs
+
+Every time you change your position (buy → sell, flat → buy, etc.), you pay a **transaction cost**. This is critical for realistic backtesting.
+
+```
+cost_t = transaction_cost × |position_t - position_{t-1}|
+profit_after_costs_t = profit_t - cost_t
+```
+
+Typical transaction costs for different assets:
+- **Stocks**: ~0.1% per trade (10 basis points)
+- **FX**: ~0.01-0.05% (1-5 bps, very liquid)
+- **Crypto**: ~0.1-0.5% (depending on exchange)
+
+A strategy that trades every day with 0.1% costs = 25% annual cost. That kills most strategies. The threshold δ helps here — by requiring a bigger deviation from 0.5 before trading, we trade less frequently.
+
+### 8.7 Multi-Asset Analysis
+
+Rather than applying to just one asset, we'll run on several to see if the Hurst signal varies by asset class:
+
+| Asset | Type | Expected behavior |
+|-------|------|-------------------|
+| SPY or major stocks | Equity | H ≈ 0.5, slight momentum at some scales |
+| EUR/CHF | FX | Often mean-reverting (central bank interventions) |
+| BTC-USD | Crypto | Potentially higher H (strong trend phases) |
+| Gold / Commodities | Commodity | Mixed, can be trending during macro regimes |
+
+This multi-asset study shows whether the Hurst signal is universal or asset-specific — something most student projects never explore.
+
+### 8.8 Regime Analysis (Value-Add)
+
+We can overlay major market events on the rolling H time series:
+
+- **COVID crash (March 2020)**: Did H spike (trending) or drop (mean-reverting)?
+- **Bull markets**: Is H persistently above 0.5?
+- **Sideways / range-bound markets**: Is H below 0.5?
+
+This connects the abstract Hurst number to real market intuition and makes for compelling visualizations.
+
+### 8.9 What Would Make Part 5 Realistic
+
+The basic TP just asks for cumulative returns and a comment. To make it actually useful:
+
+1. **Sharpe ratio**: Risk-adjusted return. `Sharpe = mean(daily_returns) / std(daily_returns) × sqrt(252)`. A Sharpe > 1 is considered good. Most academic strategies have Sharpe < 0.5 after costs.
+2. **Maximum drawdown**: The worst peak-to-trough decline. Shows the worst-case scenario.
+3. **Win rate**: What fraction of trades are profitable.
+4. **Turnover**: How often the position changes. Lower is better (fewer costs).
+5. **Comparison vs buy-and-hold**: The simplest benchmark. If you can't beat holding the asset, the strategy is useless.
+
+These metrics tell the complete story of whether the strategy is viable, not just whether cumulative returns go up.
 
 ---
 
@@ -889,6 +1080,33 @@ The network's predictions tend to be pulled toward the center of the training di
 
 ### Q: What is MC Dropout and why does uncertainty matter?
 MC (Monte Carlo) Dropout keeps dropout on during prediction and runs the same input through the network many times. Each run gives a slightly different answer because different neurons are dropped. If all runs agree → the network is confident. If runs scatter → the network is unsure. This matters for trading: you should only trade when the network is **confident** that H ≠ 0.5. A prediction of "H = 0.6 ± 0.01" is actionable; "H = 0.6 ± 0.2" is not.
+
+### Q: Why did the Dense network beat the CNN?
+With series length T=100, the CNN compresses the signal through 3 pooling layers, reducing 100 → 50 → 25 → 12 values. That's aggressive — subtle differences between H=0.8 and H=0.9 live in long-range correlations that get pooled away. The Dense network sees all 100 values at once without any compression. For longer series (T=500+), the CNN would likely win because its local pattern detection would have more data to work with.
+
+### Q: Why does the ensemble work so well with only 193 parameters?
+The ensemble's input is just 2 numbers (H_dense, H_cnn). It's learning a simple correction function: "given these two estimates, what's the best final estimate?" This is a much easier problem than estimating H from 100 raw numbers. The meta-learner just needs to learn when Dense is more trustworthy vs CNN, and how to weight them — a very low-dimensional problem that doesn't need many parameters.
+
+### Q: Why didn't the enhanced ensemble (with uncertainty) beat the basic one?
+The MC Dropout uncertainty values didn't add useful information beyond what the two raw predictions already contain. When Dense and CNN strongly disagree, the basic ensemble already knows to "hedge" — it doesn't need a separate uncertainty number to tell it that. Adding noisy features to a small model can actually hurt by introducing signal-to-noise problems.
+
+### Q: How to improve the ensemble further? (TP question)
+Several approaches: (1) Add more diverse base models (LSTM, Transformer, different hyperparameters). The key is diversity — models that make different errors. (2) Residual learning — predict the correction to the best single model rather than H itself. (3) Post-hoc calibration — fit a simple function to remove any remaining systematic bias. (4) Train the base models with different random seeds and ensemble across seeds.
+
+### Q: What are log returns and why use them?
+Log return = ln(price_t / price_{t-1}). They're preferred over simple returns because they're additive (sum up over time), symmetric (±10% cancel), and more stationary. For small price changes, log returns ≈ simple returns. We use log returns for modeling/estimation but simple returns for computing actual profit/loss.
+
+### Q: What is a rolling window and why do we need it?
+Our model expects 100-number inputs, but we have years of daily data (1000+ points). A rolling window slides through the data: days 1-100, then 2-101, then 3-102, etc. Each window produces one H estimate. This gives us a time series of H values that shows how market memory evolves over time.
+
+### Q: What is the Sharpe ratio?
+The most important risk-adjusted performance metric. `Sharpe = mean(returns) / std(returns) × sqrt(252)`. It measures return per unit of risk. A Sharpe of 1 means you earn 1 unit of return for each unit of volatility you bear. Sharpe > 1 is good, > 2 is excellent, < 0.5 is mediocre. Most real strategies after costs have Sharpe < 1.
+
+### Q: What is maximum drawdown?
+The largest percentage decline from a peak to a subsequent trough. If your portfolio goes from $100 to $150 to $120, the max drawdown is (150-120)/150 = 20%. It measures the worst pain an investor would experience. A strategy with high returns but 50% max drawdown is very risky — you'd lose half your money at some point before recovering.
+
+### Q: Why do transaction costs matter so much?
+Every time you trade, you pay a cost (bid-ask spread, commissions). If your strategy trades daily and costs are 0.1% per trade, that's ~25% annual drag. A strategy that looks great in a backtest without costs often becomes unprofitable once costs are included. The threshold δ for H reduces trading frequency, which reduces costs.
 
 ---
 
